@@ -1,15 +1,20 @@
+import io
 import logging
 import os
 import random
 import re
 import sys
 import traceback
+import urllib.request
+
+from PIL import Image
+import imagehash
 
 # Сразу пишем в stderr — Bothost/Docker могут буферизовать stdout
 sys.stderr.write("[bot] bot.py загружается...\n")
 sys.stderr.flush()
 
-from telegram import Update
+from telegram import MessageEntity, Update
 from telegram.ext import (
     Application,
     ContextTypes,
@@ -47,6 +52,15 @@ def get_token():
 
 
 REPLY_CHANCE = 0.1
+
+MOAI_EMOJI = "🗿"
+MOAI_KEYWORDS = ("moai", "moyai", "моаи", "moais", "rapanui", "easter")
+MOAI_REF_URLS = (
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Moai_Rano_raraku.jpg/220px-Moai_Rano_raraku.jpg",
+    "https://upload.wikimedia.org/wikipedia/commons/thumb/2/27/Moai_Ika_Tere_Ahu_Tongariki.jpg/220px-Moai_Ika_Tere_Ahu_Tongariki.jpg",
+)
+MOAI_HASH_THRESHOLD = 16
+MOAI_REF_HASHES: list[imagehash.ImageHash] = []
 
 REPLY_TO_BOT_RESPONSES = [
     "Иди нахуй",
@@ -173,6 +187,143 @@ def distort_text(text: str) -> str:
 
     return " ".join(new_words)
 
+
+def load_moai_reference_hashes():
+    global MOAI_REF_HASHES
+
+    hashes = []
+    for url in MOAI_REF_URLS:
+        try:
+            with urllib.request.urlopen(url, timeout=15) as response:
+                data = response.read()
+            image = Image.open(io.BytesIO(data))
+            hashes.append(imagehash.phash(image))
+            logger.info("Загружен эталон Moai: %s", url)
+        except Exception as error:
+            logger.warning("Не удалось загрузить эталон Moai %s: %s", url, error)
+
+    MOAI_REF_HASHES = hashes
+    if hashes:
+        logger.info("Эталонов Moai для сравнения: %d", len(hashes))
+    else:
+        logger.warning(
+            "Эталоны Moai не загрузились — фото будут проверяться "
+            "только по эмодзи, подписи и стикерам"
+        )
+
+
+def has_moai_text(text: str | None) -> bool:
+    if not text:
+        return False
+    if MOAI_EMOJI in text:
+        return True
+    lower = text.lower()
+    return any(keyword in lower for keyword in MOAI_KEYWORDS)
+
+
+def has_moai_entities(message) -> bool:
+    entities = (message.entities or []) + (message.caption_entities or [])
+    for entity in entities:
+        if entity.type == MessageEntity.CUSTOM_EMOJI:
+            chunk = (message.text or message.caption or "")[
+                entity.offset : entity.offset + entity.length
+            ]
+            if MOAI_EMOJI in chunk:
+                return True
+    return False
+
+
+def is_moai_sticker(sticker) -> bool:
+    if sticker.emoji == MOAI_EMOJI:
+        return True
+    set_name = (sticker.set_name or "").lower()
+    return any(keyword in set_name for keyword in MOAI_KEYWORDS)
+
+
+def image_matches_moai(image_bytes: bytes) -> bool:
+    if not MOAI_REF_HASHES:
+        return False
+
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        if getattr(image, "is_animated", False):
+            image.seek(0)
+        image_hash = imagehash.phash(image)
+    except Exception as error:
+        logger.warning("Не удалось проанализировать изображение: %s", error)
+        return False
+
+    return any(
+        image_hash - reference_hash <= MOAI_HASH_THRESHOLD
+        for reference_hash in MOAI_REF_HASHES
+    )
+
+
+async def download_message_image(message, context) -> bytes | None:
+    file_id = None
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.sticker and not message.sticker.is_video:
+        file_id = message.sticker.file_id
+    elif message.animation:
+        file_id = message.animation.file_id
+    elif (
+        message.document
+        and message.document.mime_type
+        and message.document.mime_type.startswith("image/")
+    ):
+        file_id = message.document.file_id
+
+    if not file_id:
+        return None
+
+    try:
+        telegram_file = await context.bot.get_file(file_id)
+        buffer = io.BytesIO()
+        await telegram_file.download_to_memory(buffer)
+        return buffer.getvalue()
+    except Exception as error:
+        logger.warning("Не удалось скачать файл для проверки Moai: %s", error)
+        return None
+
+
+async def is_moai_message(message, context) -> bool:
+    if has_moai_text(message.text) or has_moai_text(message.caption):
+        return True
+
+    if has_moai_entities(message):
+        return True
+
+    if message.sticker and is_moai_sticker(message.sticker):
+        return True
+
+    image_bytes = await download_message_image(message, context)
+    if image_bytes and image_matches_moai(image_bytes):
+        return True
+
+    return False
+
+
+async def try_delete_moai(message, context) -> bool:
+    if message.from_user and message.from_user.is_bot:
+        return False
+
+    if not await is_moai_message(message, context):
+        return False
+
+    try:
+        await message.delete()
+        logger.info(
+            "Удалено сообщение с Moai от user_id=%s",
+            message.from_user.id if message.from_user else "?",
+        )
+        return True
+    except Exception as error:
+        logger.warning("Не удалось удалить сообщение с Moai: %s", error)
+        return False
+
+
 async def handle_message(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -182,16 +333,12 @@ async def handle_message(
     if message is None:
         return
 
+    if await try_delete_moai(message, context):
+        return
+
     text = message.text or message.caption or ""
 
     if not text:
-        return
-
-    if "🗿" in text:
-        try:
-            await message.delete()
-        except Exception as error:
-            logger.warning("Не удалось удалить сообщение: %s", error)
         return
 
     if message.from_user and message.from_user.is_bot:
@@ -254,10 +401,19 @@ def main():
 
     app.add_handler(
         MessageHandler(
-            filters.TEXT | filters.CAPTION,
+            (
+                filters.TEXT
+                | filters.CAPTION
+                | filters.PHOTO
+                | filters.Sticker.ALL
+                | filters.ANIMATION
+                | filters.Document.IMAGE
+            ),
             handle_message,
         )
     )
+
+    load_moai_reference_hashes()
 
     logger.info("Бот запущен, начинаю polling...")
     app.run_polling(
