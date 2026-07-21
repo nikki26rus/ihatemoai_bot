@@ -1,6 +1,9 @@
+import logging
 import os
 import random
 import re
+import sys
+import traceback
 
 from telegram import Update
 from telegram.ext import (
@@ -11,23 +14,33 @@ from telegram.ext import (
 )
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
+
 # =========================
 # НАСТРОЙКИ
 # =========================
 
-TOKEN = (
-    os.getenv("BOT_TOKEN")
-    or os.getenv("API_TOKEN")
-    or os.getenv("TELEGRAM_BOT_TOKEN")
-    or "8369198534:AAFUm8r4BkuR-qrPYdbQKBEAgrN5MfSl3f8"
-)
+def get_token():
+    for name in ("BOT_TOKEN", "API_TOKEN", "TELEGRAM_BOT_TOKEN"):
+        token = os.getenv(name)
+        if token:
+            logger.info("Токен получен из переменной %s", name)
+            return token.strip()
+    return None
 
-# Вероятность ответа на сообщение.
-# 0.05 = 5%
+
 REPLY_CHANCE = 0.1
 
-
-# Ответы, когда пишут в reply на сообщение бота
 REPLY_TO_BOT_RESPONSES = [
     "Иди нахуй",
     "Нахуй иди",
@@ -58,19 +71,7 @@ REPLY_TO_BOT_RESPONSES = [
 ]
 
 
-# =========================
-# ИСКАЖЕНИЕ ТЕКСТА
-# =========================
-
 def distort_text(text):
-    """
-    Немного искажает текст.
-    Например:
-    "Блин, я проспал"
-    ->
-    "Блинмс, я проспалмс"
-    """
-
     words = text.split()
 
     if not words:
@@ -79,11 +80,7 @@ def distort_text(text):
     new_words = []
 
     for word in words:
-
-        # Иногда добавляем "мс" в конец слова
         if random.random() < 0.35:
-
-            # Сохраняем знаки препинания в конце
             match = re.match(r"^(.*?)([,.!?]*)$", word)
 
             if match:
@@ -98,20 +95,13 @@ def distort_text(text):
 
         new_words.append(word)
 
-    result = " ".join(new_words)
+    return " ".join(new_words)
 
-    return result
-
-
-# =========================
-# ОБРАБОТКА СООБЩЕНИЙ
-# =========================
 
 async def handle_message(
     update: Update,
-    context: ContextTypes.DEFAULT_TYPE
+    context: ContextTypes.DEFAULT_TYPE,
 ):
-
     message = update.effective_message
 
     if message is None:
@@ -122,35 +112,15 @@ async def handle_message(
     if not text:
         return
 
-
-    # =========================
-    # УДАЛЕНИЕ 🗿
-    # =========================
-
     if "🗿" in text:
-
         try:
             await message.delete()
-            return
-
         except Exception as error:
-            print(
-                f"Не удалось удалить сообщение: {error}"
-            )
-
-
-    # =========================
-    # СЛУЧАЙНЫЙ ОТВЕТ
-    # =========================
-
-    # Не отвечаем на сообщения самого бота
-    if message.from_user and message.from_user.is_bot:
+            logger.warning("Не удалось удалить сообщение: %s", error)
         return
 
-
-    # =========================
-    # ОТВЕТ НА REPLY К СООБЩЕНИЮ БОТА
-    # =========================
+    if message.from_user and message.from_user.is_bot:
+        return
 
     reply_to = message.reply_to_message
 
@@ -164,62 +134,66 @@ async def handle_message(
                 random.choice(REPLY_TO_BOT_RESPONSES)
             )
         except Exception as error:
-            print(
-                f"Не удалось отправить ответ на reply: {error}"
-            )
+            logger.warning("Не удалось отправить ответ на reply: %s", error)
         return
 
-
-    # С вероятностью REPLY_CHANCE отвечаем
     if random.random() > REPLY_CHANCE:
         return
 
-
-    # Искажаем текст
     distorted = distort_text(text)
 
-
-    # Отвечаем на исходное сообщение
     try:
-
-        await message.reply_text(
-            distorted
-        )
-
+        await message.reply_text(distorted)
     except Exception as error:
-
-        print(
-            f"Не удалось отправить ответ: {error}"
-        )
+        logger.warning("Не удалось отправить ответ: %s", error)
 
 
-# =========================
-# ЗАПУСК БОТА
-# =========================
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(
+        "Необработанная ошибка: %s",
+        context.error,
+        exc_info=context.error,
+    )
+
 
 def main():
+    logger.info("Запуск bot.py")
+
+    token = get_token()
+
+    if not token:
+        logger.error(
+            "BOT_TOKEN не найден. "
+            "Проверь токен в настройках бота на Bothost."
+        )
+        sys.exit(1)
 
     app = (
         Application
         .builder()
-        .token(TOKEN)
+        .token(token)
         .build()
     )
 
+    app.add_error_handler(on_error)
 
-    # Обрабатываем текстовые сообщения
     app.add_handler(
         MessageHandler(
             filters.TEXT | filters.CAPTION,
-            handle_message
+            handle_message,
         )
     )
 
-
-    print("Бот запущен!")
-
-    app.run_polling()
+    logger.info("Бот запущен, начинаю polling...")
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        logger.error("Критическая ошибка при запуске:\n%s", traceback.format_exc())
+        sys.exit(1)
