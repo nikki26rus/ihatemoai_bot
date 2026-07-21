@@ -1,3 +1,4 @@
+import os
 import random
 import re
 
@@ -14,7 +15,12 @@ from telegram.ext import (
 # НАСТРОЙКИ
 # =========================
 
-TOKEN = "8369198534:AAFUm8r4BkuR-qrPYdbQKBEAgrN5MfSl3f8"
+TOKEN = (
+    os.getenv("BOT_TOKEN")
+    or os.getenv("API_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN")
+    or "8369198534:AAFUm8r4BkuR-qrPYdbQKBEAgrN5MfSl3f8"
+)
 
 # Вероятность ответа на сообщение.
 # 0.05 = 5%
@@ -204,7 +210,7 @@ def main():
     # Обрабатываем текстовые сообщения
     app.add_handler(
         MessageHandler(
-            filters.TEXT,
+            filters.TEXT | filters.CAPTION,
             handle_message
         )
     )
