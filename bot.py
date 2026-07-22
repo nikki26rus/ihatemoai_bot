@@ -51,7 +51,7 @@ def get_token():
     return None
 
 
-REPLY_CHANCE = 0.1
+REPLY_CHANCE = 0.01
 
 MOAI_EMOJI = "🗿"
 MOAI_KEYWORDS = ("moai", "moyai", "моаи", "moais", "rapanui", "easter")
