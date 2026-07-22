@@ -53,7 +53,7 @@ def get_token():
     return None
 
 
-REPLY_CHANCE = 1
+REPLY_CHANCE = float(os.getenv("REPLY_CHANCE", "0.1"))
 
 MOAI_EMOJI = "🗿"
 MOAI_KEYWORDS = ("moai", "moyai", "моаи", "moais", "rapanui", "easter")
@@ -76,8 +76,12 @@ MOAI_REF_HASHES: dict[str, list[imagehash.ImageHash]] = {
 # --- Google Gemini (контекстные ответы) ---
 # Ключ: https://aistudio.google.com/apikey  (переменная GEMINI_API_KEY)
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
-GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
+GEMINI_DEFAULT_MODEL = "gemini-2.5-flash-lite"
+GEMINI_FALLBACK_MODELS = (
+    "gemini-2.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+)
 GEMINI_PRO_MODEL = "gemini-2.5-pro"
 GEMINI_KEY_VARS = (
     "GEMINI_API_KEY",
@@ -89,8 +93,28 @@ GEMINI_KEY_VARS = (
 GEMINI_KEY_HELP = "https://aistudio.google.com/apikey"
 
 
-def get_llm_config() -> tuple[str | None, str, str, str]:
-    """API-ключ, base URL, модель и запасная модель."""
+def get_gemini_models() -> list[str]:
+    if os.getenv("LLM_MODEL"):
+        models = [os.getenv("LLM_MODEL", "").strip()]
+    elif os.getenv("LLM_PRO", "").lower() in ("1", "true", "yes"):
+        models = [GEMINI_PRO_MODEL]
+    else:
+        models = [GEMINI_DEFAULT_MODEL]
+
+    for model in GEMINI_FALLBACK_MODELS:
+        if model not in models:
+            models.append(model)
+
+    for model in os.getenv("LLM_FALLBACK_MODELS", "").split(","):
+        model = model.strip()
+        if model and model not in models:
+            models.append(model)
+
+    return models
+
+
+def get_llm_config() -> tuple[str | None, str, list[str]]:
+    """API-ключ, base URL и список моделей для перебора."""
     api_key = None
     key_source = None
     for name in GEMINI_KEY_VARS:
@@ -102,28 +126,22 @@ def get_llm_config() -> tuple[str | None, str, str, str]:
 
     custom_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
     base_url = custom_base or GEMINI_BASE_URL
+    models = get_gemini_models()
 
-    if os.getenv("LLM_MODEL"):
-        model = os.getenv("LLM_MODEL", "").strip()
-    elif os.getenv("LLM_PRO", "").lower() in ("1", "true", "yes"):
-        model = GEMINI_PRO_MODEL
-    else:
-        model = GEMINI_DEFAULT_MODEL
-
-    if api_key and key_source:
+    if api_key and key_source and os.getenv("LLM_LOG_KEY_SOURCE") == "1":
         logger.info("Gemini: ключ из переменной %s", key_source)
 
-    return api_key, base_url, model, GEMINI_FALLBACK_MODEL
+    return api_key, base_url, models
 
 
 def log_llm_config() -> None:
-    api_key, base_url, model, _fallback = get_llm_config()
+    api_key, base_url, models = get_llm_config()
     if api_key:
         preview = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 10 else "***"
         logger.info(
-            "Gemini: %s, модель=%s, ключ=%s",
+            "Gemini: %s, модели=%s, ключ=%s",
             base_url,
-            model,
+            " -> ".join(models),
             preview,
         )
     else:
@@ -270,8 +288,10 @@ def _format_gemini_error(last_error: str) -> str:
         return "неверный GEMINI_API_KEY — создай новый на aistudio.google.com/apikey"
     if "403" in last_error or "Forbidden" in last_error:
         return "Gemini отклонил запрос (403) — проверь ключ и лимиты в AI Studio"
-    if "429" in last_error:
-        return "лимит запросов Gemini — подожди минуту или смени модель"
+    if "429" in last_error or "quota" in last_error.lower():
+        return "лимит Gemini исчерпан — подожди или создай новый ключ/проект в AI Studio"
+    if "404" in last_error or "NOT_FOUND" in last_error:
+        return "модель Gemini недоступна — обнови бота или задай LLM_MODEL на Bothost"
     return last_error
 
 
@@ -280,7 +300,7 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
     if not user_text:
         return fallback_bully_response(text, "пустое сообщение")
 
-    api_key, base_url, model, fallback_model = get_llm_config()
+    api_key, base_url, models = get_llm_config()
 
     if not api_key:
         return fallback_bully_response(
@@ -292,21 +312,18 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
     if author:
         user_message = f"[{author}]: {user_text}"
 
-    models_to_try = [model]
-    if model != fallback_model:
-        models_to_try.append(fallback_model)
-
     last_error = "неизвестная ошибка"
+    primary_model = models[0]
 
-    for attempt_model in models_to_try:
+    for attempt_model in models:
         try:
             reply = await _request_gemini(
                 api_key, base_url, attempt_model, user_message
             )
             if reply:
-                if attempt_model != model:
+                if attempt_model != primary_model:
                     logger.info(
-                        "Gemini ответил через запасную модель %s",
+                        "Gemini ответил через модель %s",
                         attempt_model,
                     )
                 return reply
@@ -317,9 +334,9 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
             status = error.response.status_code if error.response else "?"
             last_error = f"HTTP {status}: {body}"
             logger.warning("Gemini %s (модель %s)", last_error, attempt_model)
-            if status in (401, 403):
+            if status == 401:
                 break
-            if attempt_model != models_to_try[-1]:
+            if attempt_model != models[-1]:
                 continue
         except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as error:
             last_error = str(error)
@@ -328,7 +345,7 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
                 attempt_model,
                 error,
             )
-            if attempt_model != models_to_try[-1]:
+            if attempt_model != models[-1]:
                 continue
 
     return fallback_bully_response(user_text, _format_gemini_error(last_error))
@@ -428,7 +445,7 @@ def has_moai_text(text: str | None) -> bool:
 
 
 def has_moai_entities(message) -> bool:
-    entities = (message.entities or []) + (message.caption_entities or [])
+    entities = list(message.entities or ()) + list(message.caption_entities or ())
     for entity in entities:
         if entity.type == MessageEntity.CUSTOM_EMOJI:
             chunk = (message.text or message.caption or "")[
@@ -521,7 +538,17 @@ async def try_delete_moai(message, context) -> bool:
     if message.from_user and message.from_user.is_bot:
         return False
 
-    if not await is_moai_message(message, context):
+    try:
+        is_moai = await is_moai_message(message, context)
+    except Exception as error:
+        logger.warning(
+            "Ошибка проверки Moai, пропускаю: %s",
+            error,
+            exc_info=True,
+        )
+        return False
+
+    if not is_moai:
         return False
 
     try:
@@ -545,16 +572,30 @@ async def handle_message(
     if message is None:
         return
 
+    chat = message.chat
+    user = message.from_user
+    user_id = user.id if user else "?"
+    chat_label = f"{chat.type}:{chat.id}"
+
     if await try_delete_moai(message, context):
+        logger.info("Moai удалён, user_id=%s, chat=%s", user_id, chat_label)
         return
 
     text = message.text or message.caption or ""
 
     if not text:
+        logger.debug("Пропуск без текста, user_id=%s, chat=%s", user_id, chat_label)
         return
 
-    if message.from_user and message.from_user.is_bot:
+    if user and user.is_bot:
         return
+
+    logger.info(
+        "Входящее: user_id=%s, chat=%s, текст=%r",
+        user_id,
+        chat_label,
+        text[:120],
+    )
 
     reply_to = message.reply_to_message
 
@@ -567,22 +608,37 @@ async def handle_message(
             await message.reply_text(
                 random.choice(REPLY_TO_BOT_RESPONSES)
             )
+            logger.info("Ответ на reply пользователю %s", user_id)
         except Exception as error:
-            logger.warning("Не удалось отправить ответ на reply: %s", error)
+            logger.warning(
+                "Не удалось отправить ответ на reply: %s",
+                error,
+                exc_info=True,
+            )
         return
 
     if random.random() > REPLY_CHANCE:
+        logger.info(
+            "Пропуск по REPLY_CHANCE (%.0f%%), user_id=%s",
+            REPLY_CHANCE * 100,
+            user_id,
+        )
         return
 
-    author = None
-    if message.from_user:
-        author = message.from_user.first_name
+    author = user.first_name if user else None
 
     try:
+        logger.info("Генерирую ответ для user_id=%s...", user_id)
         reply = await generate_bully_response(text, author=author)
         await message.reply_text(reply)
+        logger.info("Ответ отправлен user_id=%s: %r", user_id, reply[:120])
     except Exception as error:
-        logger.warning("Не удалось отправить ответ: %s", error)
+        logger.warning(
+            "Не удалось отправить ответ user_id=%s: %s",
+            user_id,
+            error,
+            exc_info=True,
+        )
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -631,6 +687,7 @@ def main():
     load_moai_reference_hashes()
     log_llm_config()
 
+    logger.info("REPLY_CHANCE=%.0f%%", REPLY_CHANCE * 100)
     logger.info("Бот запущен, начинаю polling...")
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
