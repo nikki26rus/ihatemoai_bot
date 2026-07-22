@@ -53,7 +53,7 @@ def get_token():
     return None
 
 
-REPLY_CHANCE = 1
+REPLY_CHANCE = 0.1
 
 MOAI_EMOJI = "🗿"
 MOAI_KEYWORDS = ("moai", "moyai", "моаи", "moais", "rapanui", "easter")
@@ -77,8 +77,9 @@ MOAI_REF_HASHES: dict[str, list[imagehash.ImageHash]] = {
 # Ключ: https://platform.deepseek.com/api_keys  (переменная DEEPSEEK_API_KEY)
 # Документация: https://api-docs.deepseek.com/
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
 DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
+DEEPSEEK_FALLBACK_MODEL = "deepseek-chat"
 
 
 def get_llm_config() -> tuple[str | None, str, str]:
@@ -93,9 +94,17 @@ def get_llm_config() -> tuple[str | None, str, str]:
             break
 
     provider = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
+    custom_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
 
-    if os.getenv("OPENAI_BASE_URL"):
-        base_url = os.getenv("OPENAI_BASE_URL", "").rstrip("/")
+    if custom_base:
+        if provider == "deepseek" and "deepseek" not in custom_base:
+            logger.warning(
+                "OPENAI_BASE_URL=%s не для DeepSeek — переменная проигнорирована",
+                custom_base,
+            )
+            base_url = DEEPSEEK_BASE_URL
+        else:
+            base_url = custom_base
     elif provider == "openai":
         base_url = "https://api.openai.com/v1"
     else:
@@ -208,7 +217,8 @@ def _clean_bully_response(raw: str) -> str:
     return text
 
 
-def fallback_bully_response(text: str) -> str:
+def fallback_bully_response(text: str, reason: str = "неизвестно") -> str:
+    logger.warning("Ответ из шаблонов (%s)", reason)
     lower = text.lower()
 
     if "?" in text or lower.startswith(("как ", "что ", "где ", "когда ", "зачем ", "почему ")):
@@ -226,23 +236,13 @@ def fallback_bully_response(text: str) -> str:
     return random.choice(FALLBACK_GENERIC_RESPONSES)
 
 
-async def generate_bully_response(text: str, author: str | None = None) -> str:
-    user_text = text.strip()[:800]
-    if not user_text:
-        return fallback_bully_response(text)
-
-    api_key, base_url, model = get_llm_config()
-    if not api_key:
-        logger.warning(
-            "DEEPSEEK_API_KEY не задан — используется шаблонный ответ"
-        )
-        return fallback_bully_response(user_text)
-
-    user_message = user_text
-    if author:
-        user_message = f"[{author}]: {user_text}"
-
-    payload = {
+async def _request_deepseek(
+    api_key: str,
+    base_url: str,
+    model: str,
+    user_message: str,
+) -> str | None:
+    payload: dict = {
         "model": model,
         "messages": [
             {"role": "system", "content": BULLY_SYSTEM_PROMPT},
@@ -250,37 +250,89 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
         ],
         "temperature": 0.95,
         "max_tokens": 120,
-        "thinking": {"type": "disabled"},
     }
+    if model.startswith("deepseek-v4"):
+        payload["thinking"] = {"type": "disabled"}
 
-    try:
-        async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
-            response = await client.post(
-                f"{base_url}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            )
-            response.raise_for_status()
-            data = response.json()
-            message = data["choices"][0]["message"]
-            content = message.get("content") or message.get("reasoning_content") or ""
-            cleaned = _clean_bully_response(content)
-            if cleaned:
-                return cleaned
-    except httpx.HTTPStatusError as error:
-        body = error.response.text[:300] if error.response else ""
-        logger.warning(
-            "LLM HTTP %s: %s",
-            error.response.status_code if error.response else "?",
-            body,
+    async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+        response = await client.post(
+            f"{base_url}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
         )
-    except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as error:
-        logger.warning("Не удалось получить ответ LLM: %s", error)
+        response.raise_for_status()
+        data = response.json()
+        message = data["choices"][0]["message"]
+        content = message.get("content") or message.get("reasoning_content") or ""
+        return _clean_bully_response(content) or None
 
-    return fallback_bully_response(user_text)
+
+async def generate_bully_response(text: str, author: str | None = None) -> str:
+    user_text = text.strip()[:800]
+    if not user_text:
+        return fallback_bully_response(text, "пустое сообщение")
+
+    api_key, base_url, model = get_llm_config()
+    if not api_key:
+        return fallback_bully_response(
+            user_text,
+            "нет DEEPSEEK_API_KEY — добавь ключ на Bothost и перезапусти бота",
+        )
+
+    user_message = user_text
+    if author:
+        user_message = f"[{author}]: {user_text}"
+
+    models_to_try = [model]
+    if model != DEEPSEEK_FALLBACK_MODEL:
+        models_to_try.append(DEEPSEEK_FALLBACK_MODEL)
+
+    last_error = "неизвестная ошибка"
+
+    for attempt_model in models_to_try:
+        try:
+            reply = await _request_deepseek(
+                api_key, base_url, attempt_model, user_message
+            )
+            if reply:
+                if attempt_model != model:
+                    logger.info(
+                        "DeepSeek ответил через запасную модель %s",
+                        attempt_model,
+                    )
+                return reply
+            last_error = f"пустой ответ от модели {attempt_model}"
+            logger.warning(last_error)
+        except httpx.HTTPStatusError as error:
+            body = error.response.text[:400] if error.response else ""
+            status = error.response.status_code if error.response else "?"
+            last_error = f"HTTP {status}: {body}"
+            logger.warning("DeepSeek %s (модель %s)", last_error, attempt_model)
+            if status in (401, 402):
+                break
+            if attempt_model != models_to_try[-1]:
+                continue
+        except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as error:
+            last_error = str(error)
+            logger.warning(
+                "DeepSeek ошибка (модель %s): %s",
+                attempt_model,
+                error,
+            )
+            if attempt_model != models_to_try[-1]:
+                continue
+
+    if "402" in last_error:
+        reason = "нет денег на балансе DeepSeek — пополни на platform.deepseek.com"
+    elif "401" in last_error:
+        reason = "неверный DEEPSEEK_API_KEY"
+    else:
+        reason = last_error
+
+    return fallback_bully_response(user_text, reason)
 
 
 def _prepare_image(image_bytes: bytes) -> Image.Image:
