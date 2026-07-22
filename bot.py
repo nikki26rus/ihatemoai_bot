@@ -6,6 +6,7 @@ import random
 import sys
 import traceback
 import urllib.request
+from collections import defaultdict, deque
 from pathlib import Path
 
 import httpx
@@ -54,6 +55,10 @@ def get_token():
 
 
 REPLY_CHANCE = float(os.getenv("REPLY_CHANCE", "0.05"))
+CONTEXT_MESSAGE_COUNT = max(0, int(os.getenv("CONTEXT_MESSAGE_COUNT", "20")))
+CHAT_CONTEXT: dict[int, deque[tuple[str, str]]] = defaultdict(
+    lambda: deque(maxlen=CONTEXT_MESSAGE_COUNT)
+)
 
 MOAI_EMOJI = "🗿"
 MOAI_KEYWORDS = ("moai", "moyai", "моаи", "moais", "rapanui", "easter")
@@ -184,6 +189,33 @@ FALLBACK_GENERIC_RESPONSES = [
 ]
 
 
+def add_to_chat_context(chat_id: int, author: str, text: str) -> None:
+    if CONTEXT_MESSAGE_COUNT <= 0:
+        return
+
+    clean_text = " ".join(text.split())[:800]
+    if clean_text:
+        CHAT_CONTEXT[chat_id].append((author[:80], clean_text))
+
+
+def format_chat_context(chat_id: int) -> str:
+    if CONTEXT_MESSAGE_COUNT <= 0:
+        return ""
+
+    messages = CHAT_CONTEXT.get(chat_id)
+    if not messages:
+        return ""
+
+    transcript = "\n".join(
+        f"{author}: {text}" for author, text in messages
+    )
+    return (
+        "Последние сообщения чата (это фон; отвечай на последнее сообщение "
+        "пользователя, но учитывай эту переписку):\n"
+        f"{transcript}"
+    )
+
+
 def _clean_bully_response(raw: str) -> str:
     text = raw.strip().strip("\"'«»")
     if text.lower().startswith("ответ:"):
@@ -264,6 +296,7 @@ async def generate_bully_response(
     author: str | None = None,
     *,
     replied_to_bot_text: str | None = None,
+    chat_context: str = "",
 ) -> str:
     user_text = text.strip()[:800]
     if not user_text:
@@ -288,6 +321,9 @@ async def generate_bully_response(
 
     if author:
         user_message = f"[{author}]: {user_message}"
+
+    if chat_context:
+        user_message = f"{chat_context}\n\nНовое сообщение:\n{user_message}"
 
     last_error = "неизвестная ошибка"
     primary_model = models[0]
@@ -576,6 +612,8 @@ async def handle_message(
 
     reply_to = message.reply_to_message
     author = user.first_name if user else None
+    context_before_message = format_chat_context(chat.id)
+    add_to_chat_context(chat.id, author or "Пользователь", text)
     is_reply_to_bot = (
         reply_to
         and reply_to.from_user
@@ -604,8 +642,10 @@ async def handle_message(
             text,
             author=author,
             replied_to_bot_text=bot_message_text if is_reply_to_bot else None,
+            chat_context=context_before_message,
         )
         await message.reply_text(reply)
+        add_to_chat_context(chat.id, "Бот", reply)
         logger.info("Ответ отправлен user_id=%s: %r", user_id, reply[:120])
     except Exception as error:
         logger.warning(
