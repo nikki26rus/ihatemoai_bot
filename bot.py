@@ -183,35 +183,6 @@ FALLBACK_GENERIC_RESPONSES = [
     "Заебал уже. Закрой рот и не открывай.",
 ]
 
-REPLY_TO_BOT_RESPONSES = [
-    "Иди нахуй",
-    "Нахуй иди",
-    "Пошёл нахуй",
-    "Иди нахуй, не мешай",
-    "Нахуй с пляжа",
-    "Съебись нахуй",
-    "Иди нахуй и не возвращайся",
-    "Нахуй иди, я занят",
-    "Тебе сюда нахуй не надо",
-    "Иди нахуй, я тут главный",
-    "Нахуй иди, разговаривать не с кем",
-    "Слышь, иди нахуй",
-    "Нахуй иди, не отвлекай",
-    "Нахуй иди, я тебя не спрашивал",
-    "Иди нахуй, ответил — уже лишнее",
-    "Нахуй иди, сам разберусь",
-    "Иди нахуй, не reply'й мне",
-    "Иди нахуй, у меня дела",
-    "Нахуй иди, не надо мне тут",
-    "Иди нахуй, я не обязан отвечать",
-    "Нахуй иди, ты мне не начальник",
-    "Иди нахуй, раз уж полез",
-    "Нахуй иди, я тебе ничего не должен",
-    "Иди нахуй, не трогай мои сообщения",
-    "Нахуй иди, я тут не для тебя",
-    "Нахуй иди, я тебя не звал",
-]
-
 
 def _clean_bully_response(raw: str) -> str:
     text = raw.strip().strip("\"'«»")
@@ -288,7 +259,12 @@ def _format_deepseek_error(last_error: str) -> str:
     return last_error
 
 
-async def generate_bully_response(text: str, author: str | None = None) -> str:
+async def generate_bully_response(
+    text: str,
+    author: str | None = None,
+    *,
+    replied_to_bot_text: str | None = None,
+) -> str:
     user_text = text.strip()[:800]
     if not user_text:
         return fallback_bully_response(text, "пустое сообщение")
@@ -300,9 +276,18 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
             f"нет DEEPSEEK_API_KEY — ключ: {DEEPSEEK_KEY_HELP}",
         )
 
-    user_message = user_text
+    if replied_to_bot_text:
+        bot_text = replied_to_bot_text.strip()[:300]
+        user_message = (
+            f"Пользователь ответил (reply) на твоё сообщение «{bot_text}». "
+            f"Его текст: {user_text}. "
+            "Ответь максимально агрессивно — он полез тебе отвечать."
+        )
+    else:
+        user_message = user_text
+
     if author:
-        user_message = f"[{author}]: {user_text}"
+        user_message = f"[{author}]: {user_message}"
 
     last_error = "неизвестная ошибка"
     primary_model = models[0]
@@ -590,26 +575,14 @@ async def handle_message(
     )
 
     reply_to = message.reply_to_message
-
-    if (
+    author = user.first_name if user else None
+    is_reply_to_bot = (
         reply_to
         and reply_to.from_user
         and reply_to.from_user.id == context.bot.id
-    ):
-        try:
-            await message.reply_text(
-                random.choice(REPLY_TO_BOT_RESPONSES)
-            )
-            logger.info("Ответ на reply пользователю %s", user_id)
-        except Exception as error:
-            logger.warning(
-                "Не удалось отправить ответ на reply: %s",
-                error,
-                exc_info=True,
-            )
-        return
+    )
 
-    if random.random() > REPLY_CHANCE:
+    if not is_reply_to_bot and random.random() > REPLY_CHANCE:
         logger.info(
             "Пропуск по REPLY_CHANCE (%.0f%%), user_id=%s",
             REPLY_CHANCE * 100,
@@ -617,11 +590,21 @@ async def handle_message(
         )
         return
 
-    author = user.first_name if user else None
+    bot_message_text = None
+    if is_reply_to_bot:
+        bot_message_text = reply_to.text or reply_to.caption or ""
 
     try:
-        logger.info("Генерирую ответ для user_id=%s...", user_id)
-        reply = await generate_bully_response(text, author=author)
+        logger.info(
+            "Генерирую ответ для user_id=%s%s...",
+            user_id,
+            " (reply на бота)" if is_reply_to_bot else "",
+        )
+        reply = await generate_bully_response(
+            text,
+            author=author,
+            replied_to_bot_text=bot_message_text if is_reply_to_bot else None,
+        )
         await message.reply_text(reply)
         logger.info("Ответ отправлен user_id=%s: %r", user_id, reply[:120])
     except Exception as error:
