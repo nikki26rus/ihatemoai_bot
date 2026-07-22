@@ -297,6 +297,7 @@ async def generate_bully_response(
     *,
     replied_to_bot_text: str | None = None,
     chat_context: str = "",
+    answer_question: bool = False,
 ) -> str:
     user_text = text.strip()[:800]
     if not user_text:
@@ -318,6 +319,14 @@ async def generate_bully_response(
         )
     else:
         user_message = user_text
+
+    if answer_question:
+        user_message = (
+            f"{user_message}\n\nПользователь обратился к тебе с вопросом. "
+            "ОБЯЗАТЕЛЬНО ответь на вопрос по существу: дай полезный и "
+            "конкретный ответ, а затем можешь грубо подколоть его. "
+            "Не уходи от ответа и не ограничивайся оскорблением."
+        )
 
     if author:
         user_message = f"[{author}]: {user_message}"
@@ -457,6 +466,29 @@ def has_moai_text(text: str | None) -> bool:
     return any(keyword in lower for keyword in MOAI_KEYWORDS)
 
 
+def text_without_own_bot_mention(
+    text: str | None,
+    entities,
+    bot_username: str | None,
+) -> str:
+    """Исключает @упоминание текущего бота из анти-Moai проверки."""
+    if not text or not bot_username:
+        return text or ""
+
+    own_mention = f"@{bot_username}".lower()
+    ranges = []
+    for entity in entities or ():
+        if entity.type != MessageEntity.MENTION:
+            continue
+        chunk = text[entity.offset : entity.offset + entity.length]
+        if chunk.lower() == own_mention:
+            ranges.append((entity.offset, entity.offset + entity.length))
+
+    for start, end in reversed(ranges):
+        text = text[:start] + text[end:]
+    return text
+
+
 def has_moai_entities(message) -> bool:
     entities = list(message.entities or ()) + list(message.caption_entities or ())
     for entity in entities:
@@ -531,7 +563,17 @@ async def download_message_image(message, context) -> bytes | None:
 
 
 async def is_moai_message(message, context) -> bool:
-    if has_moai_text(message.text) or has_moai_text(message.caption):
+    text = text_without_own_bot_mention(
+        message.text,
+        message.entities,
+        context.bot.username,
+    )
+    caption = text_without_own_bot_mention(
+        message.caption,
+        message.caption_entities,
+        context.bot.username,
+    )
+    if has_moai_text(text) or has_moai_text(caption):
         return True
 
     if has_moai_entities(message):
@@ -614,13 +656,32 @@ async def handle_message(
     author = user.first_name if user else None
     context_before_message = format_chat_context(chat.id)
     add_to_chat_context(chat.id, author or "Пользователь", text)
+    text_without_mention = text_without_own_bot_mention(
+        message.text or message.caption,
+        message.entities or message.caption_entities,
+        context.bot.username,
+    )
+    lower_text_without_mention = text_without_mention.lower().lstrip()
+    is_question_to_bot = (
+        text_without_mention != (message.text or message.caption)
+        and (
+            "?" in text_without_mention
+            or lower_text_without_mention.startswith(
+                ("как ", "что ", "кто ", "где ", "когда ", "зачем ", "почему ")
+            )
+        )
+    )
     is_reply_to_bot = (
         reply_to
         and reply_to.from_user
         and reply_to.from_user.id == context.bot.id
     )
 
-    if not is_reply_to_bot and random.random() > REPLY_CHANCE:
+    if (
+        not is_reply_to_bot
+        and not is_question_to_bot
+        and random.random() > REPLY_CHANCE
+    ):
         logger.info(
             "Пропуск по REPLY_CHANCE (%.0f%%), user_id=%s",
             REPLY_CHANCE * 100,
@@ -636,13 +697,18 @@ async def handle_message(
         logger.info(
             "Генерирую ответ для user_id=%s%s...",
             user_id,
-            " (reply на бота)" if is_reply_to_bot else "",
+            (
+                " (reply на бота)"
+                if is_reply_to_bot
+                else " (вопрос через @)" if is_question_to_bot else ""
+            ),
         )
         reply = await generate_bully_response(
             text,
             author=author,
             replied_to_bot_text=bot_message_text if is_reply_to_bot else None,
             chat_context=context_before_message,
+            answer_question=is_question_to_bot,
         )
         await message.reply_text(reply)
         add_to_chat_context(chat.id, "Бот", reply)
