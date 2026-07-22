@@ -53,7 +53,7 @@ def get_token():
     return None
 
 
-REPLY_CHANCE = float(os.getenv("REPLY_CHANCE", "0.1"))
+REPLY_CHANCE = float(os.getenv("REPLY_CHANCE", "0.05"))
 
 MOAI_EMOJI = "🗿"
 MOAI_KEYWORDS = ("moai", "moyai", "моаи", "moais", "rapanui", "easter")
