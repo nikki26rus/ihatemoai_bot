@@ -73,35 +73,26 @@ MOAI_REF_HASHES: dict[str, list[imagehash.ImageHash]] = {
     "whash": [],
 }
 
-# --- Google Gemini (контекстные ответы) ---
-# Ключ: https://aistudio.google.com/apikey  (переменная GEMINI_API_KEY)
-GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
-GEMINI_DEFAULT_MODEL = "gemini-2.5-flash-lite"
-GEMINI_FALLBACK_MODELS = (
-    "gemini-2.5-flash-lite",
-    "gemini-3.1-flash-lite",
-    "gemini-2.5-flash",
-)
-GEMINI_PRO_MODEL = "gemini-2.5-pro"
-GEMINI_KEY_VARS = (
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
-    "GOOGLE_AI_STUDIO_KEY",
-    "OPENAI_API_KEY",
-    "LLM_API_KEY",
-)
-GEMINI_KEY_HELP = "https://aistudio.google.com/apikey"
+# --- DeepSeek (контекстные ответы) ---
+# Ключ: https://platform.deepseek.com/api_keys  (переменная DEEPSEEK_API_KEY)
+# Баланс: https://platform.deepseek.com
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
+DEEPSEEK_FALLBACK_MODELS = ("deepseek-chat", "deepseek-v4-flash")
+DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
+DEEPSEEK_KEY_VARS = ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY")
+DEEPSEEK_KEY_HELP = "https://platform.deepseek.com/api_keys"
 
 
-def get_gemini_models() -> list[str]:
+def get_deepseek_models() -> list[str]:
     if os.getenv("LLM_MODEL"):
         models = [os.getenv("LLM_MODEL", "").strip()]
     elif os.getenv("LLM_PRO", "").lower() in ("1", "true", "yes"):
-        models = [GEMINI_PRO_MODEL]
+        models = [DEEPSEEK_PRO_MODEL]
     else:
-        models = [GEMINI_DEFAULT_MODEL]
+        models = [DEEPSEEK_DEFAULT_MODEL]
 
-    for model in GEMINI_FALLBACK_MODELS:
+    for model in DEEPSEEK_FALLBACK_MODELS:
         if model not in models:
             models.append(model)
 
@@ -113,11 +104,10 @@ def get_gemini_models() -> list[str]:
     return models
 
 
-def get_llm_config() -> tuple[str | None, str, list[str]]:
-    """API-ключ, base URL и список моделей для перебора."""
+def get_deepseek_config() -> tuple[str | None, str, list[str], str | None]:
     api_key = None
     key_source = None
-    for name in GEMINI_KEY_VARS:
+    for name in DEEPSEEK_KEY_VARS:
         value = os.getenv(name)
         if value:
             api_key = value.strip()
@@ -125,30 +115,26 @@ def get_llm_config() -> tuple[str | None, str, list[str]]:
             break
 
     custom_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
-    base_url = custom_base or GEMINI_BASE_URL
-    models = get_gemini_models()
-
-    if api_key and key_source and os.getenv("LLM_LOG_KEY_SOURCE") == "1":
-        logger.info("Gemini: ключ из переменной %s", key_source)
-
-    return api_key, base_url, models
+    base_url = custom_base or DEEPSEEK_BASE_URL
+    return api_key, base_url, get_deepseek_models(), key_source
 
 
 def log_llm_config() -> None:
-    api_key, base_url, models = get_llm_config()
+    api_key, base_url, models, key_source = get_deepseek_config()
     if api_key:
         preview = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 10 else "***"
         logger.info(
-            "Gemini: %s, модели=%s, ключ=%s",
+            "DeepSeek: %s, модели=%s, ключ=%s (%s)",
             base_url,
             " -> ".join(models),
             preview,
+            key_source,
         )
     else:
         logger.warning(
-            "GEMINI_API_KEY не задан — бот отвечает шаблонами. "
+            "DEEPSEEK_API_KEY не задан — бот отвечает шаблонами. "
             "Ключ: %s",
-            GEMINI_KEY_HELP,
+            DEEPSEEK_KEY_HELP,
         )
 
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "20"))
@@ -251,13 +237,13 @@ def fallback_bully_response(text: str, reason: str = "неизвестно") -> 
     return random.choice(FALLBACK_GENERIC_RESPONSES)
 
 
-async def _request_gemini(
+async def _request_deepseek(
     api_key: str,
     base_url: str,
     model: str,
     user_message: str,
 ) -> str | None:
-    payload = {
+    payload: dict = {
         "model": model,
         "messages": [
             {"role": "system", "content": BULLY_SYSTEM_PROMPT},
@@ -266,10 +252,12 @@ async def _request_gemini(
         "temperature": 0.95,
         "max_tokens": 120,
     }
+    if model.startswith("deepseek-v4"):
+        payload["thinking"] = {"type": "disabled"}
 
     async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
         response = await client.post(
-            f"{base_url}/chat/completions",
+            f"{base_url.rstrip('/')}/chat/completions",
             headers={
                 "Authorization": f"Bearer {api_key}",
                 "Content-Type": "application/json",
@@ -279,19 +267,20 @@ async def _request_gemini(
         response.raise_for_status()
         data = response.json()
         message = data["choices"][0]["message"]
-        content = message.get("content") or ""
+        content = message.get("content") or message.get("reasoning_content") or ""
         return _clean_bully_response(content) or None
 
 
-def _format_gemini_error(last_error: str) -> str:
-    if "401" in last_error or "API key not valid" in last_error:
-        return "неверный GEMINI_API_KEY — создай новый на aistudio.google.com/apikey"
-    if "403" in last_error or "Forbidden" in last_error:
-        return "Gemini отклонил запрос (403) — проверь ключ и лимиты в AI Studio"
-    if "429" in last_error or "quota" in last_error.lower():
-        return "лимит Gemini исчерпан — подожди или создай новый ключ/проект в AI Studio"
-    if "404" in last_error or "NOT_FOUND" in last_error:
-        return "модель Gemini недоступна — обнови бота или задай LLM_MODEL на Bothost"
+def _format_deepseek_error(last_error: str) -> str:
+    lower = last_error.lower()
+    if "402" in last_error or "insufficient balance" in lower:
+        return "нет денег на балансе DeepSeek — пополни на platform.deepseek.com"
+    if "401" in last_error or "api key" in lower:
+        return "неверный DEEPSEEK_API_KEY — ключ: platform.deepseek.com/api_keys"
+    if "429" in last_error or "quota" in lower:
+        return "лимит DeepSeek — подожди минуту"
+    if "404" in last_error or "not_found" in lower:
+        return "модель DeepSeek недоступна — задай LLM_MODEL=deepseek-chat"
     return last_error
 
 
@@ -300,12 +289,11 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
     if not user_text:
         return fallback_bully_response(text, "пустое сообщение")
 
-    api_key, base_url, models = get_llm_config()
-
+    api_key, base_url, models, _key_source = get_deepseek_config()
     if not api_key:
         return fallback_bully_response(
             user_text,
-            f"нет GEMINI_API_KEY — ключ: {GEMINI_KEY_HELP}",
+            f"нет DEEPSEEK_API_KEY — ключ: {DEEPSEEK_KEY_HELP}",
         )
 
     user_message = user_text
@@ -317,13 +305,13 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
 
     for attempt_model in models:
         try:
-            reply = await _request_gemini(
+            reply = await _request_deepseek(
                 api_key, base_url, attempt_model, user_message
             )
             if reply:
                 if attempt_model != primary_model:
                     logger.info(
-                        "Gemini ответил через модель %s",
+                        "DeepSeek ответил через модель %s",
                         attempt_model,
                     )
                 return reply
@@ -333,22 +321,22 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
             body = error.response.text[:400] if error.response else ""
             status = error.response.status_code if error.response else "?"
             last_error = f"HTTP {status}: {body}"
-            logger.warning("Gemini %s (модель %s)", last_error, attempt_model)
-            if status == 401:
+            logger.warning("DeepSeek %s (модель %s)", last_error, attempt_model)
+            if status in (401, 402):
                 break
             if attempt_model != models[-1]:
                 continue
         except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as error:
             last_error = str(error)
             logger.warning(
-                "Gemini ошибка (модель %s): %s",
+                "DeepSeek ошибка (модель %s): %s",
                 attempt_model,
                 error,
             )
             if attempt_model != models[-1]:
                 continue
 
-    return fallback_bully_response(user_text, _format_gemini_error(last_error))
+    return fallback_bully_response(user_text, _format_deepseek_error(last_error))
 
 
 def _prepare_image(image_bytes: bytes) -> Image.Image:
