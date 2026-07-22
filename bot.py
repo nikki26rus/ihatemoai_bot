@@ -1,12 +1,14 @@
 import io
+import json
 import logging
 import os
 import random
-import re
 import sys
 import traceback
 import urllib.request
+from pathlib import Path
 
+import httpx
 from PIL import Image
 import imagehash
 
@@ -51,16 +53,121 @@ def get_token():
     return None
 
 
-REPLY_CHANCE = 0.01
+REPLY_CHANCE = 0.1
 
 MOAI_EMOJI = "🗿"
 MOAI_KEYWORDS = ("moai", "moyai", "моаи", "moais", "rapanui", "easter")
+MOAI_REF_DIR = Path(__file__).resolve().parent / "assets" / "moai_refs"
 MOAI_REF_URLS = (
     "https://upload.wikimedia.org/wikipedia/commons/thumb/a/a2/Moai_Rano_raraku.jpg/220px-Moai_Rano_raraku.jpg",
     "https://upload.wikimedia.org/wikipedia/commons/thumb/2/27/Moai_Ika_Tere_Ahu_Tongariki.jpg/220px-Moai_Ika_Tere_Ahu_Tongariki.jpg",
 )
-MOAI_HASH_THRESHOLD = 16
-MOAI_REF_HASHES: list[imagehash.ImageHash] = []
+MOAI_HASH_CHECKS = (
+    (imagehash.phash, 20),
+    (imagehash.dhash, 14),
+    (imagehash.whash, 22),
+)
+MOAI_REF_HASHES: dict[str, list[imagehash.ImageHash]] = {
+    "phash": [],
+    "dhash": [],
+    "whash": [],
+}
+
+# --- DeepSeek (LLM для контекстных ответов) ---
+# Ключ: https://platform.deepseek.com/api_keys  (переменная DEEPSEEK_API_KEY)
+# Документация: https://api-docs.deepseek.com/
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_DEFAULT_MODEL = "deepseek-v4-flash"
+DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
+
+
+def get_llm_config() -> tuple[str | None, str, str]:
+    """API-ключ, base URL и модель для chat/completions."""
+    api_key = None
+    key_source = None
+    for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"):
+        value = os.getenv(name)
+        if value:
+            api_key = value.strip()
+            key_source = name
+            break
+
+    provider = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
+
+    if os.getenv("OPENAI_BASE_URL"):
+        base_url = os.getenv("OPENAI_BASE_URL", "").rstrip("/")
+    elif provider == "openai":
+        base_url = "https://api.openai.com/v1"
+    else:
+        base_url = DEEPSEEK_BASE_URL
+
+    if os.getenv("LLM_MODEL"):
+        model = os.getenv("LLM_MODEL", "").strip()
+    elif provider == "openai":
+        model = "gpt-4o-mini"
+    elif os.getenv("LLM_PRO", "").lower() in ("1", "true", "yes"):
+        model = DEEPSEEK_PRO_MODEL
+    else:
+        model = DEEPSEEK_DEFAULT_MODEL
+
+    if api_key and key_source:
+        logger.info("LLM-ключ из переменной %s", key_source)
+
+    return api_key, base_url, model
+
+
+def log_llm_config() -> None:
+    api_key, base_url, model = get_llm_config()
+    if api_key:
+        preview = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 10 else "***"
+        logger.info("LLM: %s, модель=%s, ключ=%s", base_url, model, preview)
+    else:
+        logger.warning(
+            "DEEPSEEK_API_KEY не задан — бот отвечает шаблонами. "
+            "Ключ: https://platform.deepseek.com/api_keys"
+        )
+
+LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "20"))
+
+BULLY_SYSTEM_PROMPT = """Ты токсичный телеграм-бот в групповом чате между знакомыми.
+На сообщения пользователей отвечай коротко: 1–2 предложения, максимум 200 символов.
+Обязательно учитывай СМЫСЛ и контекст того, что написал человек — высмеивай, подкалывай или грубо комментируй именно это, а не абстрактно.
+Стиль: грубый, саркастичный, иногда мат (как в чате между друзьями). Не будь формальным и не морализируй.
+Не пересказывай сообщение пользователя дословно. Не объясняй, почему ты так ответил.
+Пиши только текст ответа, без кавычек, без markdown и без пояснений."""
+
+FALLBACK_QUESTION_RESPONSES = [
+    "Серьёзно ты это спрашиваешь? Сам подумай, не ленись.",
+    "Вопрос уровня «я только проснулся». Гугл в помощь.",
+    "Такие вопросы задают, когда мозг на перекуре.",
+    "Ты это реально не знаешь или просто проверяешь, жив ли чат?",
+]
+
+FALLBACK_GREETING_RESPONSES = [
+    "О, приполз. Не радуйся, это не compliment.",
+    "Здарова. Только не думай, что мы скучали.",
+    "Привет. Сразу предупреждаю: настроение — «иди нахуй».",
+]
+
+FALLBACK_COMPLAINT_RESPONSES = [
+    "Ну и кто тебя заставлял? Сам написал — сам страдай.",
+    "Жалуешься в чат, будто мы тут служба поддержки твоей жизни.",
+    "Опять всем world pain? Никто не заказывал.",
+]
+
+FALLBACK_BRAG_RESPONSES = [
+    "Ух ты, герой. Медаль за участие уже отправил — в мусорку.",
+    "Слышал, но всё равно похуй. Расскажи ещё раз, вдруг станет интересно.",
+    "Круто для тебя. Для остальных — просто шум в ленте.",
+]
+
+FALLBACK_GENERIC_RESPONSES = [
+    "Написал — и сразу стало ясно, зачем кнопка mute.",
+    "Твоё сообщение — как Wi‑Fi в лифте: вроде есть, но толку ноль.",
+    "Прочитал. Жалею. В следующий раз просто промолчи.",
+    "Если это было умно — я пропустил момент.",
+    "Спасибо, теперь понятно, кого сегодня игнорить.",
+]
 
 REPLY_TO_BOT_RESPONSES = [
     "Иди нахуй",
@@ -92,124 +199,172 @@ REPLY_TO_BOT_RESPONSES = [
 ]
 
 
-WORD_PATTERN = re.compile(r"^([\w\-']+)([,.!?…:;]*)$", re.UNICODE)
-
-SUFFIXES = ["мс", "м", "с", "ъ", "ок", "ик", "ух", "я"]
-INSERT_CHARS = ["м", "с", "ъ", "ы", "о"]
-VOWEL_SWAPS = {
-    "а": "о",
-    "о": "а",
-    "е": "и",
-    "и": "е",
-    "у": "ю",
-    "ю": "у",
-    "я": "а",
-    "ы": "и",
-}
+def _clean_bully_response(raw: str) -> str:
+    text = raw.strip().strip("\"'«»")
+    if text.lower().startswith("ответ:"):
+        text = text.split(":", 1)[1].strip()
+    if len(text) > 300:
+        text = text[:297].rstrip() + "..."
+    return text
 
 
-def _distort_word_core(core: str) -> str:
-    if len(core) < 2:
-        return core + random.choice(SUFFIXES)
+def fallback_bully_response(text: str) -> str:
+    lower = text.lower()
 
-    method = random.choice(
-        ("suffix", "double", "insert", "swap", "vowel", "repeat_end")
-    )
+    if "?" in text or lower.startswith(("как ", "что ", "где ", "когда ", "зачем ", "почему ")):
+        return random.choice(FALLBACK_QUESTION_RESPONSES)
 
-    if method == "suffix":
-        return core + random.choice(SUFFIXES)
+    if any(word in lower for word in ("привет", "здарова", "здорово", "хай", "hello", "hi")):
+        return random.choice(FALLBACK_GREETING_RESPONSES)
 
-    if method == "double":
-        index = random.randrange(len(core))
-        letter = core[index]
-        return core[: index + 1] + letter + core[index + 1 :]
+    if any(word in lower for word in ("устал", "бесит", "заеб", "плохо", "жал", "надоел", "достал")):
+        return random.choice(FALLBACK_COMPLAINT_RESPONSES)
 
-    if method == "insert":
-        index = random.randrange(1, len(core))
-        return core[:index] + random.choice(INSERT_CHARS) + core[index:]
+    if any(word in lower for word in ("я ", "мне ", "сделал", "купил", "выиграл", "получил", "красав")):
+        return random.choice(FALLBACK_BRAG_RESPONSES)
 
-    if method == "swap" and len(core) >= 3:
-        index = random.randrange(len(core) - 1)
-        chars = list(core)
-        chars[index], chars[index + 1] = chars[index + 1], chars[index]
-        return "".join(chars)
-
-    if method == "vowel":
-        chars = list(core)
-        vowel_indexes = [
-            index
-            for index, char in enumerate(chars)
-            if char.lower() in VOWEL_SWAPS
-        ]
-        if vowel_indexes:
-            index = random.choice(vowel_indexes)
-            char = chars[index]
-            replacement = VOWEL_SWAPS[char.lower()]
-            chars[index] = replacement.upper() if char.isupper() else replacement
-            return "".join(chars)
-
-    # repeat_end — «проспал» -> «проспаал»
-    return core + core[-1] + random.choice(SUFFIXES[:3])
+    return random.choice(FALLBACK_GENERIC_RESPONSES)
 
 
-def distort_word(word: str) -> str:
-    match = WORD_PATTERN.match(word)
-    if not match:
-        return word
+async def generate_bully_response(text: str, author: str | None = None) -> str:
+    user_text = text.strip()[:800]
+    if not user_text:
+        return fallback_bully_response(text)
 
-    core, punctuation = match.group(1), match.group(2)
-    if not core or core.isdigit():
-        return word
+    api_key, base_url, model = get_llm_config()
+    if not api_key:
+        logger.warning(
+            "DEEPSEEK_API_KEY не задан — используется шаблонный ответ"
+        )
+        return fallback_bully_response(user_text)
 
-    return _distort_word_core(core) + punctuation
+    user_message = user_text
+    if author:
+        user_message = f"[{author}]: {user_text}"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": BULLY_SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        "temperature": 0.95,
+        "max_tokens": 120,
+        "thinking": {"type": "disabled"},
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+            response = await client.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+            message = data["choices"][0]["message"]
+            content = message.get("content") or message.get("reasoning_content") or ""
+            cleaned = _clean_bully_response(content)
+            if cleaned:
+                return cleaned
+    except httpx.HTTPStatusError as error:
+        body = error.response.text[:300] if error.response else ""
+        logger.warning(
+            "LLM HTTP %s: %s",
+            error.response.status_code if error.response else "?",
+            body,
+        )
+    except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as error:
+        logger.warning("Не удалось получить ответ LLM: %s", error)
+
+    return fallback_bully_response(user_text)
 
 
-def distort_text(text: str) -> str:
-    words = text.split()
-    if not words:
-        return text
+def _prepare_image(image_bytes: bytes) -> Image.Image:
+    image = Image.open(io.BytesIO(image_bytes))
+    if getattr(image, "is_animated", False):
+        image.seek(0)
+    return image.convert("RGB")
 
-    # Коверкаем 60–100% слов, минимум одно
-    min_distorted = max(1, len(words) // 2)
-    max_distorted = len(words)
-    target_count = random.randint(min_distorted, max_distorted)
 
-    indexes = list(range(len(words)))
-    random.shuffle(indexes)
-    distort_indexes = set(indexes[:target_count])
-
-    new_words = []
-    for index, word in enumerate(words):
-        if index in distort_indexes:
-            new_words.append(distort_word(word))
-        else:
-            new_words.append(word)
-
-    return " ".join(new_words)
+def _add_reference_image(image: Image.Image, source: str):
+    for hash_func, _threshold in MOAI_HASH_CHECKS:
+        hash_name = hash_func.__name__
+        MOAI_REF_HASHES[hash_name].append(hash_func(image))
+    logger.info("Добавлен эталон Moai: %s", source)
 
 
 def load_moai_reference_hashes():
-    global MOAI_REF_HASHES
+    for hash_name in MOAI_REF_HASHES:
+        MOAI_REF_HASHES[hash_name].clear()
 
-    hashes = []
+    file_count = 0
+    if MOAI_REF_DIR.is_dir():
+        for path in sorted(MOAI_REF_DIR.iterdir()):
+            if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp"}:
+                continue
+            try:
+                image = Image.open(path).convert("RGB")
+                _add_reference_image(image, path.name)
+                file_count += 1
+            except Exception as error:
+                logger.warning(
+                    "Не удалось загрузить локальный эталон %s: %s",
+                    path.name,
+                    error,
+                )
+
     for url in MOAI_REF_URLS:
         try:
             with urllib.request.urlopen(url, timeout=15) as response:
                 data = response.read()
-            image = Image.open(io.BytesIO(data))
-            hashes.append(imagehash.phash(image))
-            logger.info("Загружен эталон Moai: %s", url)
+            image = _prepare_image(data)
+            _add_reference_image(image, url)
+            file_count += 1
         except Exception as error:
             logger.warning("Не удалось загрузить эталон Moai %s: %s", url, error)
 
-    MOAI_REF_HASHES = hashes
-    if hashes:
-        logger.info("Эталонов Moai для сравнения: %d", len(hashes))
+    if file_count:
+        logger.info("Эталонов Moai для сравнения: %d", file_count)
     else:
         logger.warning(
             "Эталоны Moai не загрузились — фото будут проверяться "
-            "только по эмодзи, подписи и стикерам"
+            "только по эмодзи, подписи, стикерам и эвристике"
         )
+
+
+def looks_like_moai_illustration(image: Image.Image) -> bool:
+    """Эвристика для мультяшных/нарисованных Moai на светлом фоне."""
+    small = image.resize((64, 64))
+    pixels = list(small.getdata())
+
+    light_pixels = sum(
+        1 for red, green, blue in pixels
+        if red > 220 and green > 220 and blue > 220
+    )
+    if light_pixels / len(pixels) < 0.25:
+        return False
+
+    def is_stone_color(red: int, green: int, blue: int) -> bool:
+        brightness = (red + green + blue) / 3
+        return brightness < 145 and blue >= red - 25 and blue >= green - 35
+
+    center_stone = 0
+    upper_stone = 0
+    for y in range(64):
+        for x in range(64):
+            red, green, blue = pixels[y * 64 + x]
+            if not is_stone_color(red, green, blue):
+                continue
+            if 18 <= x <= 45:
+                center_stone += 1
+            if 12 <= x <= 50 and 8 <= y <= 42:
+                upper_stone += 1
+
+    return center_stone >= 90 and upper_stone >= 60
 
 
 def has_moai_text(text: str | None) -> bool:
@@ -241,22 +396,28 @@ def is_moai_sticker(sticker) -> bool:
 
 
 def image_matches_moai(image_bytes: bytes) -> bool:
-    if not MOAI_REF_HASHES:
-        return False
-
     try:
-        image = Image.open(io.BytesIO(image_bytes))
-        if getattr(image, "is_animated", False):
-            image.seek(0)
-        image_hash = imagehash.phash(image)
+        image = _prepare_image(image_bytes)
     except Exception as error:
         logger.warning("Не удалось проанализировать изображение: %s", error)
         return False
 
-    return any(
-        image_hash - reference_hash <= MOAI_HASH_THRESHOLD
-        for reference_hash in MOAI_REF_HASHES
-    )
+    for hash_func, threshold in MOAI_HASH_CHECKS:
+        hash_name = hash_func.__name__
+        references = MOAI_REF_HASHES.get(hash_name, [])
+        if not references:
+            continue
+
+        image_hash = hash_func(image)
+        if any(image_hash - reference_hash <= threshold for reference_hash in references):
+            logger.info("Moai найден по hash %s", hash_name)
+            return True
+
+    if looks_like_moai_illustration(image):
+        logger.info("Moai найден по эвристике иллюстрации")
+        return True
+
+    return False
 
 
 async def download_message_image(message, context) -> bytes | None:
@@ -362,10 +523,13 @@ async def handle_message(
     if random.random() > REPLY_CHANCE:
         return
 
-    distorted = distort_text(text)
+    author = None
+    if message.from_user:
+        author = message.from_user.first_name
 
     try:
-        await message.reply_text(distorted)
+        reply = await generate_bully_response(text, author=author)
+        await message.reply_text(reply)
     except Exception as error:
         logger.warning("Не удалось отправить ответ: %s", error)
 
@@ -414,6 +578,7 @@ def main():
     )
 
     load_moai_reference_hashes()
+    log_llm_config()
 
     logger.info("Бот запущен, начинаю polling...")
     app.run_polling(
