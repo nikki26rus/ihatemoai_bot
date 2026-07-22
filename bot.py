@@ -73,67 +73,103 @@ MOAI_REF_HASHES: dict[str, list[imagehash.ImageHash]] = {
     "whash": [],
 }
 
-# --- DeepSeek (LLM для контекстных ответов) ---
-# Ключ: https://platform.deepseek.com/api_keys  (переменная DEEPSEEK_API_KEY)
-# Документация: https://api-docs.deepseek.com/
+# --- LLM (контекстные ответы) ---
+# По умолчанию: Google Gemini (бесплатно, ключ на aistudio.google.com/apikey)
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai"
+GEMINI_DEFAULT_MODEL = "gemini-2.0-flash"
+GEMINI_FALLBACK_MODEL = "gemini-2.5-flash"
+GEMINI_PRO_MODEL = "gemini-2.5-pro"
+
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_DEFAULT_MODEL = "deepseek-chat"
 DEEPSEEK_PRO_MODEL = "deepseek-v4-pro"
 DEEPSEEK_FALLBACK_MODEL = "deepseek-chat"
 
+LLM_PROVIDER_PRESETS = {
+    "gemini": {
+        "base_url": GEMINI_BASE_URL,
+        "default_model": GEMINI_DEFAULT_MODEL,
+        "fallback_model": GEMINI_FALLBACK_MODEL,
+        "pro_model": GEMINI_PRO_MODEL,
+        "key_vars": (
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_AI_STUDIO_KEY",
+            "OPENAI_API_KEY",
+            "LLM_API_KEY",
+        ),
+        "key_help": "https://aistudio.google.com/apikey",
+    },
+    "deepseek": {
+        "base_url": DEEPSEEK_BASE_URL,
+        "default_model": DEEPSEEK_DEFAULT_MODEL,
+        "fallback_model": DEEPSEEK_FALLBACK_MODEL,
+        "pro_model": DEEPSEEK_PRO_MODEL,
+        "key_vars": ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"),
+        "key_help": "https://platform.deepseek.com/api_keys",
+    },
+}
 
-def get_llm_config() -> tuple[str | None, str, str]:
-    """API-ключ, base URL и модель для chat/completions."""
+
+def get_llm_config() -> tuple[str | None, str, str, str, str]:
+    """Ключ, base URL, модель, провайдер, запасная модель."""
+    provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+    if provider not in LLM_PROVIDER_PRESETS:
+        logger.warning("Неизвестный LLM_PROVIDER=%s, использую gemini", provider)
+        provider = "gemini"
+
+    preset = LLM_PROVIDER_PRESETS[provider]
     api_key = None
     key_source = None
-    for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "LLM_API_KEY"):
+    for name in preset["key_vars"]:
         value = os.getenv(name)
         if value:
             api_key = value.strip()
             key_source = name
             break
 
-    provider = os.getenv("LLM_PROVIDER", "deepseek").strip().lower()
     custom_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
-
     if custom_base:
-        if provider == "deepseek" and "deepseek" not in custom_base:
-            logger.warning(
-                "OPENAI_BASE_URL=%s не для DeepSeek — переменная проигнорирована",
-                custom_base,
-            )
-            base_url = DEEPSEEK_BASE_URL
-        else:
-            base_url = custom_base
+        base_url = custom_base
     elif provider == "openai":
         base_url = "https://api.openai.com/v1"
     else:
-        base_url = DEEPSEEK_BASE_URL
+        base_url = preset["base_url"]
 
     if os.getenv("LLM_MODEL"):
         model = os.getenv("LLM_MODEL", "").strip()
     elif provider == "openai":
         model = "gpt-4o-mini"
     elif os.getenv("LLM_PRO", "").lower() in ("1", "true", "yes"):
-        model = DEEPSEEK_PRO_MODEL
+        model = preset["pro_model"]
     else:
-        model = DEEPSEEK_DEFAULT_MODEL
+        model = preset["default_model"]
+
+    fallback_model = preset["fallback_model"]
 
     if api_key and key_source:
-        logger.info("LLM-ключ из переменной %s", key_source)
+        logger.info("LLM (%s): ключ из переменной %s", provider, key_source)
 
-    return api_key, base_url, model
+    return api_key, base_url, model, provider, fallback_model
 
 
 def log_llm_config() -> None:
-    api_key, base_url, model = get_llm_config()
+    api_key, base_url, model, provider, _fallback = get_llm_config()
+    preset = LLM_PROVIDER_PRESETS.get(provider, LLM_PROVIDER_PRESETS["gemini"])
     if api_key:
         preview = f"{api_key[:4]}...{api_key[-4:]}" if len(api_key) > 10 else "***"
-        logger.info("LLM: %s, модель=%s, ключ=%s", base_url, model, preview)
+        logger.info(
+            "LLM: провайдер=%s, %s, модель=%s, ключ=%s",
+            provider,
+            base_url,
+            model,
+            preview,
+        )
     else:
         logger.warning(
-            "DEEPSEEK_API_KEY не задан — бот отвечает шаблонами. "
-            "Ключ: https://platform.deepseek.com/api_keys"
+            "GEMINI_API_KEY не задан — бот отвечает шаблонами. "
+            "Ключ: %s",
+            preset["key_help"],
         )
 
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "20"))
@@ -236,11 +272,12 @@ def fallback_bully_response(text: str, reason: str = "неизвестно") -> 
     return random.choice(FALLBACK_GENERIC_RESPONSES)
 
 
-async def _request_deepseek(
+async def _request_llm(
     api_key: str,
     base_url: str,
     model: str,
     user_message: str,
+    provider: str,
 ) -> str | None:
     payload: dict = {
         "model": model,
@@ -251,7 +288,7 @@ async def _request_deepseek(
         "temperature": 0.95,
         "max_tokens": 120,
     }
-    if model.startswith("deepseek-v4"):
+    if provider == "deepseek" and model.startswith("deepseek-v4"):
         payload["thinking"] = {"type": "disabled"}
 
     async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
@@ -270,16 +307,34 @@ async def _request_deepseek(
         return _clean_bully_response(content) or None
 
 
+def _format_llm_error(provider: str, last_error: str) -> str:
+    if "402" in last_error:
+        return "нет денег на балансе DeepSeek — пополни на platform.deepseek.com"
+    if "401" in last_error or "API key not valid" in last_error:
+        if provider == "gemini":
+            return "неверный GEMINI_API_KEY — создай новый на aistudio.google.com/apikey"
+        return f"неверный API-ключ для {provider}"
+    if "403" in last_error or "Forbidden" in last_error:
+        if provider == "gemini":
+            return "Gemini отклонил запрос (403) — проверь ключ и лимиты в AI Studio"
+        return f"{provider} вернул Forbidden — возможна блокировка региона"
+    if "429" in last_error:
+        return "лимит запросов LLM — подожди минуту или смени модель"
+    return last_error
+
+
 async def generate_bully_response(text: str, author: str | None = None) -> str:
     user_text = text.strip()[:800]
     if not user_text:
         return fallback_bully_response(text, "пустое сообщение")
 
-    api_key, base_url, model = get_llm_config()
+    api_key, base_url, model, provider, fallback_model = get_llm_config()
+    preset = LLM_PROVIDER_PRESETS.get(provider, LLM_PROVIDER_PRESETS["gemini"])
+
     if not api_key:
         return fallback_bully_response(
             user_text,
-            "нет DEEPSEEK_API_KEY — добавь ключ на Bothost и перезапусти бота",
+            f"нет GEMINI_API_KEY — ключ: {preset['key_help']}",
         )
 
     user_message = user_text
@@ -287,20 +342,21 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
         user_message = f"[{author}]: {user_text}"
 
     models_to_try = [model]
-    if model != DEEPSEEK_FALLBACK_MODEL:
-        models_to_try.append(DEEPSEEK_FALLBACK_MODEL)
+    if model != fallback_model:
+        models_to_try.append(fallback_model)
 
     last_error = "неизвестная ошибка"
 
     for attempt_model in models_to_try:
         try:
-            reply = await _request_deepseek(
-                api_key, base_url, attempt_model, user_message
+            reply = await _request_llm(
+                api_key, base_url, attempt_model, user_message, provider
             )
             if reply:
                 if attempt_model != model:
                     logger.info(
-                        "DeepSeek ответил через запасную модель %s",
+                        "LLM (%s) ответил через запасную модель %s",
+                        provider,
                         attempt_model,
                     )
                 return reply
@@ -310,29 +366,27 @@ async def generate_bully_response(text: str, author: str | None = None) -> str:
             body = error.response.text[:400] if error.response else ""
             status = error.response.status_code if error.response else "?"
             last_error = f"HTTP {status}: {body}"
-            logger.warning("DeepSeek %s (модель %s)", last_error, attempt_model)
-            if status in (401, 402):
+            logger.warning(
+                "LLM (%s) %s (модель %s)", provider, last_error, attempt_model
+            )
+            if status in (401, 402, 403):
                 break
             if attempt_model != models_to_try[-1]:
                 continue
         except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError) as error:
             last_error = str(error)
             logger.warning(
-                "DeepSeek ошибка (модель %s): %s",
+                "LLM (%s) ошибка (модель %s): %s",
+                provider,
                 attempt_model,
                 error,
             )
             if attempt_model != models_to_try[-1]:
                 continue
 
-    if "402" in last_error:
-        reason = "нет денег на балансе DeepSeek — пополни на platform.deepseek.com"
-    elif "401" in last_error:
-        reason = "неверный DEEPSEEK_API_KEY"
-    else:
-        reason = last_error
-
-    return fallback_bully_response(user_text, reason)
+    return fallback_bully_response(
+        user_text, _format_llm_error(provider, last_error)
+    )
 
 
 def _prepare_image(image_bytes: bytes) -> Image.Image:
