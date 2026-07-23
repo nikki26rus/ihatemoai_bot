@@ -256,7 +256,7 @@ async def _request_deepseek(
             {"role": "system", "content": BULLY_SYSTEM_PROMPT},
             {"role": "user", "content": user_message},
         ],
-        "temperature": 0.4,
+        "temperature": 0.1,
         "max_tokens": 120,
     }
     if model.startswith("deepseek-v4"):
